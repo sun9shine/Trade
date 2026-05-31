@@ -177,3 +177,38 @@ class MetricsSnapshot(Base):
     avg_latency_ms = Column(Float, nullable=True)
     kill_switch_active = Column(Boolean, default=False)
     recorded_at = Column(DateTime, server_default=func.now())
+
+
+
+# ─── USER MANAGEMENT ─────────────────────────────────────────────────────────
+
+class User(Base):
+    """Admin panel user accounts with role-based access."""
+    __tablename__ = "users"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    username = Column(String(50), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(20), nullable=False, default="viewer")
+    # "admin", "operator", "viewer"
+    display_name = Column(String(100), nullable=True)
+    is_active = Column(Boolean, default=True)
+    last_login = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+# ─── AUDIT LOG ────────────────────────────────────────────────────────────────
+
+class AuditLog(Base):
+    """Security audit trail for all administrative actions."""
+    __tablename__ = "audit_log"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    actor = Column(String(50), default="system")
+    action = Column(String(100), nullable=False)
+    resource_type = Column(String(50), nullable=True)
+    resource_id = Column(String(200), nullable=True)
+    details = Column(Text, nullable=True)
+    ip_address = Column(String(45), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())

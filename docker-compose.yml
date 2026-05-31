@@ -33,7 +33,7 @@ services:
       timeout: 3s
       retries: 5
 
-  # ─── Python Backend (FastAPI) ───────────────────────────────────────────────
+  # ─── Python Backend API (FastAPI) ───────────────────────────────────────────
   backend:
     build:
       context: ./backend
@@ -50,7 +50,27 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
+      - backend_logs:/app/logs
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ─── Worker Engine (Arbitrage Execution) ────────────────────────────────────
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: arb_worker
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - backend_logs:/app/logs
+    command: python -m app.worker
+    restart: unless-stopped
 
   # ─── Next.js Admin Panel ────────────────────────────────────────────────────
   frontend:
@@ -69,5 +89,24 @@ services:
       - /app/node_modules
     command: npm run dev
 
+  # ─── Nginx Reverse Proxy (SSL/HTTPS) ───────────────────────────────────────
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: arb_nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+      - frontend
+    volumes:
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    restart: unless-stopped
+    profiles:
+      - production
+
 volumes:
   pgdata:
+  backend_logs:

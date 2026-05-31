@@ -1,5 +1,6 @@
 """
 FastAPI Application — REST API + WebSocket gateway for the Arbitrage Bot.
+Includes: Auth (JWT+RBAC), Rate Limiting, Middleware, Multi-user support.
 """
 
 import asyncio
@@ -9,18 +10,24 @@ from typing import Optional
 from uuid import uuid4
 
 import structlog
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Header
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from app.config import app_settings, risk_settings
 from app.database import get_db, async_session_factory
-from app.security import create_access_token, verify_access_token, encrypt_secret, decrypt_secret
+from app.security import encrypt_secret, decrypt_secret
+from app.auth import (
+    UserRepository, UserRole, UserCreate, LoginRequest, TokenResponse,
+    create_access_token, create_refresh_token, decode_token, check_permission,
+)
+from app.middleware import RateLimitMiddleware, RequestLoggingMiddleware, SecurityHeadersMiddleware
 from app.connectors.polymarket import PolymarketConnector
 from app.connectors.premu import PremuConnector
 from app.connectors.monaco import MonacoConnector
 from app.engine.arbitrage_router import ArbitrageRouter
 from app.engine.webhook_handler import WebhookHandler, MacroEventPayload
+from app.repositories import TradeRepository, PositionRepository, MetricsRepository
 
 logger = structlog.get_logger(__name__)
 
@@ -40,7 +47,8 @@ ws_connections: set[WebSocket] = set()
 async def lifespan(app: FastAPI):
     """Application startup/shutdown lifecycle."""
     logger.info("app.starting", env=app_settings.app_env)
-    # Initialization of connectors happens on-demand (lazy)
+    # Ensure default admin exists on first run
+    await UserRepository.ensure_admin_exists()
     yield
     logger.info("app.shutting_down")
 
@@ -53,6 +61,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Apply middleware (order matters — last added = first executed)
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(RateLimitMiddleware)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://localhost:3001"],
@@ -64,29 +77,64 @@ app.add_middleware(
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-
 @app.post("/api/auth/login")
 async def login(req: LoginRequest):
-    """Authenticate admin user and return JWT."""
-    # Simple admin auth — in production, use proper user store
-    if req.username == "admin" and req.password == app_settings.app_secret_key:
-        token = create_access_token(data={"sub": "admin", "role": "admin"})
-        return {"access_token": token, "token_type": "bearer"}
-    raise HTTPException(status_code=401, detail="Invalid credentials")
+    """Authenticate user and return JWT tokens."""
+    user = await UserRepository.authenticate(req.username, req.password)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    access_token = create_access_token(user["id"], user["username"], UserRole(user["role"]))
+    refresh_token = create_refresh_token(user["id"], user["username"], UserRole(user["role"]))
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+        "expires_in": 3600,
+        "user": user,
+    }
 
 
-def require_auth(authorization: Optional[str] = Header(None)):
-    """Dependency to validate JWT token."""
+@app.post("/api/auth/refresh")
+async def refresh_token(token: str = Header(alias="X-Refresh-Token")):
+    """Refresh an access token using a valid refresh token."""
+    payload = decode_token(token)
+    if not payload or payload.get("type") != "refresh":
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+    new_access = create_access_token(payload["sub"], payload["username"], UserRole(payload["role"]))
+    return {"access_token": new_access, "token_type": "bearer", "expires_in": 3600}
+
+
+@app.post("/api/auth/register", dependencies=[Depends(require_auth)])
+async def register_user(user: UserCreate, current_user=Depends(require_auth)):
+    """Create a new user (admin only)."""
+    if not check_permission(UserRole(current_user["role"]), "users:write"):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    result = await UserRepository.create_user(user)
+    if not result:
+        raise HTTPException(status_code=409, detail="Username already exists")
+    return result
+
+
+@app.get("/api/auth/users", dependencies=[Depends(require_auth)])
+async def list_users(current_user=Depends(require_auth)):
+    """List all users (admin only)."""
+    if not check_permission(UserRole(current_user["role"]), "users:read"):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+    return await UserRepository.list_users()
+
+
+def require_auth(authorization: Optional[str] = Header(None)) -> dict:
+    """Dependency to validate JWT token and extract user info."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing authorization")
     token = authorization.split(" ")[1]
-    payload = verify_access_token(token)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    payload = decode_token(token)
+    if not payload or payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
     return payload
 
 
